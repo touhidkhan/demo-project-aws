@@ -1,0 +1,80 @@
+name: Update GitOps Repository
+
+on:
+  workflow_run:
+    workflows: ["Build, Push and Scan Docker Image"]
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: devops-radar
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  gitops-update:
+    name: Update GitOps Repository
+    runs-on: ubuntu-latest
+    # Only run if the build workflow was successful
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Get commit SHA
+        id: commit
+        run: |
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "sha=${COMMIT_SHA::7}" >> $GITHUB_OUTPUT
+          echo "Will update image tag to: ${COMMIT_SHA::7}"
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+
+      # Step 3: Checkout your GitOps repository using deploy key (SSH)
+      # GITOPS_REPO format: owner/repo-name (e.g., amdadulbari/cloudnative-gitops)
+      - name: Checkout GitOps repository
+        run: |
+          git clone git@github.com:${{ secrets.GITOPS_REPO }}.git gitops-repo
+          cd gitops-repo
+          git checkout main || git checkout master
+
+      # Step 4: Configure Git and update image tag
+      - name: Configure Git and update image tag
+        working-directory: gitops-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          COMMIT_SHA="${{ steps.commit.outputs.sha }}"
+          IMAGE_PATTERN="${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          
+          echo "Updating frontend/deployment.yml"
+          echo "Replacing any existing tag with: ${IMAGE_PATTERN}:${COMMIT_SHA}"
+          
+          # Replace any existing tag (latest, commit-sha, etc.) with new commit-sha
+          # This works for both :latest and previous commit SHAs
+          # Example: amdadulbari/devops-radar:latest → amdadulbari/devops-radar:abc1234
+          # Example: amdadulbari/devops-radar:6f11072 → amdadulbari/devops-radar:abc1234
+          sed -i "s|${IMAGE_PATTERN}:[^[:space:]]*|${IMAGE_PATTERN}:${COMMIT_SHA}|g" frontend/deployment.yml
+          
+          echo ""
+          echo "Changes in frontend/deployment.yml:"
+          git diff frontend/deployment.yml || echo "No changes"
+
+      # Step 5: Commit and push the changes using deploy key
+      - name: Commit and push
+        working-directory: gitops-repo
+        run: |
+          git add frontend/deployment.yml
+          
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update devops-radar image tag to ${{ steps.commit.outputs.sha }}"
+            # Push using deploy key (configured via SSH)
+            git push origin main || git push origin master
+            echo "✅ Successfully updated frontend/deployment.yml!"
+          fi
